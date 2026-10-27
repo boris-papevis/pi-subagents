@@ -26,7 +26,7 @@ import { findNestedRouteForRootId, hasLiveNestedDescendants, retainNestedLookupR
 import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
 import type { RawDrainStatusObserver } from "../shared/readonly-drain-observation.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, externalJobBridgeEligibility, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
-import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
+import { isWatchTargetRename, shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
 import { withWorkflowChildRunModel } from "./workflow-terminal-proof.ts";
 import { validHostStepNodes } from "../shared/host-step-status.ts";
@@ -637,7 +637,15 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			const nestedEventSink = job.nestedRoute?.eventSink === watchPath;
 			let watcher: fs.FSWatcher;
 			try {
-				watcher = watch(resolveWatchPath(watchPath), (_event, file) => {
+				const resolvedPath = resolveWatchPath(watchPath);
+				watcher = watch(resolvedPath, (event, file) => {
+					if (jobWatchers.get(job.asyncId) !== watched || watched.watchers.get(watchPath) !== watcher) return;
+					if ((watchPath === job.asyncDir || nestedEventSink) && isWatchTargetRename(event, file, resolvedPath)) {
+						watcher.close();
+						watched.watchers.delete(watchPath);
+						scheduleJobRefresh(job.asyncId);
+						return;
+					}
 					const rawFileName = file?.toString();
 					const fileName = rawFileName ?? path.basename(watchPath);
 					const nestedEventFile = nestedEventSink && (!rawFileName || rawFileName.endsWith(".json") || rawFileName.endsWith(".jsonl"));
@@ -654,6 +662,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				return false;
 			}
 			watcher.on("error", () => {
+				if (jobWatchers.get(job.asyncId) !== watched || watched.watchers.get(watchPath) !== watcher) return;
 				watcher.close();
 				watched.watchers.delete(watchPath);
 				if (watchPath.endsWith("status.json") || nestedEventSink) watchJob(job);
@@ -689,7 +698,14 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		if (!useNativeWatcher()) return;
 		if (rootWatcher) return;
 		try {
-			rootWatcher = watch(resolveWatchPath(asyncDirRoot), (_event, file) => {
+			const resolvedRoot = resolveWatchPath(asyncDirRoot);
+			const watcher: fs.FSWatcher = watch(resolvedRoot, (event, file) => {
+				if (rootWatcher !== watcher) return;
+				if (isWatchTargetRename(event, file, resolvedRoot)) {
+					watcher.close();
+					rootWatcher = undefined;
+					return;
+				}
 				const runDirName = file?.toString();
 				for (const job of state.asyncJobs.values()) {
 					if (jobWatchers.has(job.asyncId) || (runDirName && path.basename(job.asyncDir) !== runDirName)) continue;
@@ -697,7 +713,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 					if (jobWatchers.has(job.asyncId)) scheduleJobRefresh(job.asyncId);
 				}
 			});
-			rootWatcher.on("error", () => {
+			rootWatcher = watcher;
+			watcher.on("error", () => {
+				if (rootWatcher !== watcher) return;
 				rootWatcher?.close();
 				rootWatcher = undefined;
 			});
@@ -723,6 +741,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			const now = Date.now();
 			if (now >= nextLivenessAt) {
 				nextLivenessAt = now + livenessIntervalMs;
+				watchAsyncRoot();
 				let widgetChanged = false;
 				for (const job of state.asyncJobs.values()) {
 					watchJob(job);

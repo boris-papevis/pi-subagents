@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -241,6 +242,44 @@ function createUiContext() {
 }
 
 describe("async job tracker", { skip: !available ? "pi packages not available" : undefined }, () => {
+	for (const targetKind of ["run", "nested", "root"] as const) {
+		it(`releases a deleted ${targetKind} watch target and reattaches on the liveness sweep`, (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: 1000 });
+			const asyncRoot = createTempDir("pi-tracker-deleted-");
+			const runDir = path.join(asyncRoot, "deleted-run");
+			const route = createNestedRoute("deleted-run");
+			const watches: Array<{ target: string; listener: fs.WatchListener<string | Buffer>; watcher: EventEmitter & { closed: boolean } }> = [];
+			const watch = ((target: fs.PathLike, listener: fs.WatchListener<string | Buffer>) => {
+				const handle = Object.assign(new EventEmitter(), { closed: false, close() { this.closed = true; }, unref() {} });
+				watches.push({ target: String(target), listener, watcher: handle });
+				return handle as unknown as fs.FSWatcher;
+			}) as typeof fs.watch;
+			const state = createState();
+			writeRunningAsyncStatus(runDir, "deleted-run", "deleted-session");
+			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, { watch, pollIntervalMs: 1000, kill: () => true });
+			try {
+				tracker.handleStarted({ id: "deleted-run", asyncDir: runDir, agent: "worker", pid: process.pid, sessionId: "deleted-session", nestedRoute: route });
+				t.mock.timers.tick(25);
+				const target = fs.realpathSync.native(targetKind === "run" ? runDir : targetKind === "nested" ? route.eventSink : asyncRoot);
+				const old = watches.find((entry) => entry.target === target)!;
+				assert.ok(old);
+				old.listener("rename", Buffer.from(path.toNamespacedPath(target)));
+				assert.equal(old.watcher.closed, true, "release the deleted directory handle");
+				t.mock.timers.tick(1000);
+				const current = watches.filter((entry) => entry.target === target).at(-1)!;
+				assert.notEqual(current, old);
+				old.listener("rename", target);
+				old.watcher.emit("error", new Error("queued old error"));
+				t.mock.timers.tick(1000);
+				assert.equal(current.watcher.closed, false);
+				assert.equal(watches.filter((entry) => entry.target === target).length, 2, "queued callbacks preserve the replacement");
+			} finally {
+				tracker.resetJobs();
+				removeTempDir(asyncRoot);
+				removeTempDir(path.dirname(route.eventSink));
+			}
+		});
+	}
 	it("drops stale captured extension contexts instead of crashing background timers", () => {
 		const asyncRoot = createTempDir("pi-async-job-tracker-stale-context-");
 		try {

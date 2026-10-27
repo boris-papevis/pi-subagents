@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- On Windows, deleting a watched background-result, run, or nested-event directory could make Pi consume a full CPU core. Pi now releases the deleted directory handle and reattaches through its existing restart timer or liveness sweep. It also checks for results published during watcher recovery.
+
 ## [0.83.0] - 2026-10-25
 
 ### Highlights

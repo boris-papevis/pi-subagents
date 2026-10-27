@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.ts";
 import { createFileCoalescer } from "../../shared/file-coalescer.ts";
-import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
+import { isWatchTargetRename, shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import {
 	SUBAGENT_ASYNC_COMPLETE_EVENT,
 	type IntercomEventBus,
@@ -783,6 +783,7 @@ export function createResultWatcher(
 			try {
 				fsApi.mkdirSync(resultsDir, { recursive: true });
 				startResultWatcher();
+				primeExistingResults();
 			} catch (error) {
 				if (shouldPoll(error)) return startPolling(error);
 				console.error(`Failed to restart subagent result watcher for '${resultsDir}':`, error);
@@ -808,7 +809,15 @@ export function createResultWatcher(
 		}
 		try {
 			const watchDir = resolveWatchPath(resultsDir, fsApi.realpathSync.native);
-			state.watcher = fsApi.watch(watchDir, (_event, file) => {
+			const watcher: fs.FSWatcher = fsApi.watch(watchDir, (event, file) => {
+				if (!deliveryActive || state.watcher !== watcher) return;
+				if (isWatchTargetRename(event, file, watchDir)) {
+					watcher.close();
+					state.watcher = null;
+					identityCache.clear();
+					scheduleRestart();
+					return;
+				}
 				if (!file) {
 					primeExistingResults();
 					return;
@@ -824,7 +833,9 @@ export function createResultWatcher(
 					scheduleResult(fileName, true);
 				}
 			});
-			state.watcher.on("error", (error) => {
+			state.watcher = watcher;
+			watcher.on("error", (error) => {
+				if (!deliveryActive || state.watcher !== watcher) return;
 				if (shouldPoll(error)) return startPolling(error);
 				console.error(`Subagent result watcher failed for '${resultsDir}':`, error);
 				state.watcher?.close();

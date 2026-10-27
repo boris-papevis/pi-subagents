@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import fsDefault, * as fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
@@ -1537,6 +1538,124 @@ describe("result watcher", () => {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
 	});
+
+	for (const bufferFilename of [false, true]) {
+		it(`recovers from a self-target rename and ignores replaced callbacks (${bufferFilename ? "Buffer" : "string"})`, async (t) => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-deleted-"));
+			const resultsDir = path.join(root, "results.json");
+			fs.mkdirSync(resultsDir);
+			const state = createState();
+			state.currentSessionId = "session-deleted";
+			const watches: Array<{ target: string; listener: fs.WatchListener<string | Buffer>; watcher: EventEmitter & { closed: boolean } }> = [];
+			let restart: (() => void) | undefined;
+			let restartCount = 0;
+			let denyRecreation = false;
+			const delivered: string[] = [];
+			t.mock.method(console, "error", () => {});
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				fs: {
+					...fs,
+					mkdirSync: ((...args: Parameters<typeof fs.mkdirSync>) => {
+						if (denyRecreation) throw Object.assign(new Error("recreation denied"), { code: "EPERM" });
+						return fs.mkdirSync(...args);
+					}) as typeof fs.mkdirSync,
+					watch: ((target: fs.PathLike, listener: fs.WatchListener<string | Buffer>) => {
+						const handle = Object.assign(new EventEmitter(), { closed: false, close() { this.closed = true; }, unref() {} });
+						watches.push({ target: String(target), listener, watcher: handle });
+						return handle as unknown as fs.FSWatcher;
+					}) as typeof fs.watch,
+				},
+				notifier: { async deliver(value) { delivered.push(value.runId!); return true; } },
+				deliverIntercomResults: false,
+				timers: {
+					setTimeout: ((handler: () => void, delay: number) => {
+						if (delay !== 3000) return setTimeout(handler, delay);
+						restart = handler;
+						restartCount++;
+						return { unref() {} } as NodeJS.Timeout;
+					}) as typeof setTimeout,
+					clearTimeout, setInterval, clearInterval,
+				},
+			});
+			try {
+				watcher.startResultWatcher();
+				const old = watches[0];
+				const filename = bufferFilename ? Buffer.from(path.toNamespacedPath(old.target)) : old.target;
+				old.listener("rename", filename);
+				assert.equal(old.watcher.closed, true, "release the deleted target before another notification");
+				assert.equal(state.watcher, null);
+				assert.equal(restartCount, 1);
+				for (let i = 0; i < 10; i++) old.listener("rename", filename);
+				assert.equal(restartCount, 1);
+				assert.equal(typeof restart, "function");
+				denyRecreation = true;
+				restart!();
+				assert.equal(restartCount, 2, "denied recreation stays on the delayed retry");
+				assert.equal(watches.length, 1);
+				denyRecreation = false;
+				writeIndexedResult(path.join(resultsDir, "gap.json"), { id: "gap", runId: "gap", sessionId: "session-deleted", success: true, summary: "done" });
+				restart!();
+				assert.equal(watches.length, 2);
+				assert.equal(await waitForPredicate(() => delivered.length === 1), true, "rescan a result published during recovery");
+				old.listener("rename", filename);
+				old.watcher.emit("error", Object.assign(new Error("late error"), { code: "EPERM" }));
+				assert.equal(state.watcher, watches[1].watcher);
+				assert.equal(restartCount, 2, "queued old callbacks preserve the replacement");
+				assert.deepEqual(delivered, ["gap"]);
+				watcher.stopResultWatcher();
+				watches[1].watcher.emit("error", Object.assign(new Error("closed error"), { code: "EPERM" }));
+				assert.equal(restartCount, 2, "shutdown prevents another restart");
+			} finally {
+				watcher.stopResultWatcher();
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		});
+	}
+
+	if (process.platform === "win32") {
+		it("closes a real Windows watcher after self-target deletion and restores result delivery", async () => {
+			const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-native-delete-"));
+			const state = createState();
+			state.currentSessionId = "session-native-deleted";
+			let restart: (() => void) | undefined;
+			let events = 0;
+			let closed = false;
+			const delivered: string[] = [];
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				fs: { ...fs, watch: ((target: fs.PathLike, listener: fs.WatchListener<string>) => {
+					const handle = fs.watch(target, (event, filename) => { events++; listener(event, filename); });
+					handle.once("close", () => { closed = true; });
+					return handle;
+				}) as typeof fs.watch },
+				notifier: { async deliver(value) { delivered.push(value.runId!); return true; } },
+				deliverIntercomResults: false,
+				timers: {
+					setTimeout: ((handler: () => void, delay: number) => {
+						if (delay !== 3000) return setTimeout(handler, delay);
+						restart = handler;
+						return { unref() {} } as NodeJS.Timeout;
+					}) as typeof setTimeout,
+					clearTimeout, setInterval, clearInterval,
+				},
+			});
+			try {
+				watcher.startResultWatcher();
+				fs.rmdirSync(resultsDir);
+				assert.equal(await waitForPredicate(() => closed), true, "close the native handle instead of repeating self events");
+				const count = events;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				assert.equal(events, count);
+				assert.equal(typeof restart, "function");
+				restart!();
+				writeIndexedResult(path.join(resultsDir, "recovered.json"), { id: "recovered", sessionId: "session-native-deleted", success: true, summary: "done" });
+				assert.equal(await waitForPredicate(() => delivered.length === 1), true);
+				assert.deepEqual(delivered, ["recovered"]);
+			} finally {
+				watcher.stopResultWatcher();
+				fs.rmSync(resultsDir, { recursive: true, force: true });
+			}
+		});
+	}
 
 	it("drains durable results when an active fs.watch misses events", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
